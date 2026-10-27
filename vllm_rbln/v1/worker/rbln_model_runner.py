@@ -31,6 +31,8 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.parallel_state import TensorMetadata, get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
     supports_eagle3,
@@ -164,7 +166,12 @@ from vllm_rbln.v1.worker.dp_utils import (
     coordinate_batch_across_dp,
     determine_batch_execution_and_padding,
 )
-from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
+from vllm_rbln.v1.worker.input_stager import (
+    PRECOMPUTED_ROPE,
+    InputLayout,
+    InputStager,
+    StagedModelInputs,
+)
 from vllm_rbln.v1.worker.utils import (
     canonical_kv_layers,
     copy_host_device_kv_blocks,
@@ -1317,6 +1324,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if is_prefill and self.use_wrapped_compute_logits
             else None,
             layout=layout,
+            host_embed=is_prefill,
         )
 
         model_kwargs = {
@@ -2214,6 +2222,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
+        if envs.VLLM_RBLN_HOST_ROPE:
+            self._register_host_rope()
+        if envs.VLLM_RBLN_HOST_EMBED:
+            self._register_host_embed()
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
@@ -2224,8 +2236,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors: IntermediateTensors | None = None,
             inputs_embeds: torch.Tensor | None = None,
             token_indices: torch.Tensor | None = None,
+            rope_cos: torch.Tensor | None = None,
+            rope_sin: torch.Tensor | None = None,
             **kwargs,
         ):
+            PRECOMPUTED_ROPE.cos, PRECOMPUTED_ROPE.sin = rope_cos, rope_sin
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -2233,6 +2248,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **kwargs,
             )
+            PRECOMPUTED_ROPE.cos = PRECOMPUTED_ROPE.sin = None
 
             logits = None
             # Only the last stage gets the aux tensors as a second return value;
@@ -2315,6 +2331,63 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 use_static_output=True,
                 dtype=self.rbln_config.compile_dtype,
             )
+
+    def _register_host_rope(self) -> None:
+        """Gather RoPE cos/sin on the host (VLLM_RBLN_HOST_ROPE): the graph then
+        takes the rows as inputs and has no index_select host op.
+        Only for models whose layers share one RoPE table."""
+        tables = {
+            id(m.cos_cache): m
+            for m in self.model.modules()
+            if isinstance(m, RotaryEmbedding) and hasattr(m, "cos_cache")
+        }
+        if len(tables) != 1 or getattr(self, "drafter", None) is not None:
+            logger.warning(
+                "VLLM_RBLN_HOST_ROPE ignored: needs one RoPE table and no drafter "
+                "(found %d tables)",
+                len(tables),
+            )
+            return
+        rope = next(iter(tables.values()))
+        self.input_stager.set_rope_tables(
+            rope.cos_cache, rope.sin_cache, self.model_config.dtype
+        )
+        logger.info(
+            "VLLM_RBLN_HOST_ROPE: RoPE rows gathered on the host, table %s",
+            tuple(rope.cos_cache.shape),
+        )
+
+    def _register_host_embed(self) -> None:
+        """Gather prefill token embeddings on the host (VLLM_RBLN_HOST_EMBED), off
+        the per-launch host path: the prefill graph takes inputs_embeds and has no
+        embedding host op. Decode keeps the in-graph gather,
+        since async scheduling fills its input ids after staging. Needs an unsharded
+        plain embedding (no scaling in embed_input_ids). Keeps a host copy of the
+        table (vocab x hidden)."""
+        embeds = [
+            m
+            for name, m in self.model.named_modules()
+            if name.split(".")[-1] in ("embedding", "embed_tokens")
+            and isinstance(m, VocabParallelEmbedding)
+        ]
+        vocab = self.model_config.get_vocab_size()
+        if (
+            len(embeds) != 1
+            or embeds[0].weight.shape[0] < vocab
+            or getattr(self, "drafter", None) is not None
+        ):
+            logger.warning(
+                "VLLM_RBLN_HOST_EMBED ignored: needs one unsharded embedding table "
+                "and no drafter (found %s, vocab %d)",
+                [(tuple(m.weight.shape), m.weight.device.type) for m in embeds],
+                vocab,
+            )
+            return
+        self.input_stager.set_embed_table(embeds[0].weight)
+        logger.info(
+            "VLLM_RBLN_HOST_EMBED: prefill embeddings gathered on the host, table %s",
+            tuple(embeds[0].weight.shape),
+        )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -2603,6 +2676,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 query_len=target_query_len,
                 query_len_padded=target_query_len,
             ),
+            host_embed=is_prefill,
         )
 
         with set_forward_context(

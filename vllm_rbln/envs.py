@@ -69,6 +69,8 @@ if TYPE_CHECKING:
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
+    VLLM_RBLN_HOST_ROPE: bool = False
+    VLLM_RBLN_HOST_EMBED: bool = False
     VLLM_RBLN_DISPATCH_ALL2ALL: bool = False
     VLLM_RBLN_COMBINE_ALL2ALL: bool = False
     # --- DECODE BATCH BUCKET ---
@@ -339,6 +341,16 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Gather the RoPE cos/sin rows on the host once per step and pass them to the
+    # graph as inputs, instead of an index_select inside the graph (a host op)
+    "VLLM_RBLN_HOST_ROPE": (
+        lambda: os.environ.get("VLLM_RBLN_HOST_ROPE", "False").lower() in ("true", "1")
+    ),
+    # Prefill only: gather the token embeddings on the host in the runner and pass
+    # inputs_embeds, instead of the embedding gather inside the graph (a host op)
+    "VLLM_RBLN_HOST_EMBED": (
+        lambda: os.environ.get("VLLM_RBLN_HOST_EMBED", "False").lower() in ("true", "1")
+    ),
     # Use all2all dispatch instead of all-gather for MoE DP dispatch
     "VLLM_RBLN_DISPATCH_ALL2ALL": (
         lambda: (
@@ -415,6 +427,8 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
         "VLLM_RBLN_USE_MOE_TOKENS_MASK",
+        "VLLM_RBLN_HOST_ROPE",
+        "VLLM_RBLN_HOST_EMBED",
         "VLLM_RBLN_DISPATCH_ALL2ALL",
         "VLLM_RBLN_COMBINE_ALL2ALL",
         "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",

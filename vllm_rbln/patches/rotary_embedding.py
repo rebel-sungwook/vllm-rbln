@@ -17,6 +17,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.v1.worker.input_stager import PRECOMPUTED_ROPE
 
 original_rope_init = RotaryEmbedding.__init__
 
@@ -94,17 +95,21 @@ def patched_rope_forward_oot(
     batch_size, seq_len = positions.shape[0], positions.shape[1]
     rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
 
-    positions_flat = positions.flatten()
-    cos = (
-        self.cos_cache.index_select(0, positions_flat)
-        .view(batch_size, 1, seq_len, -1)
-        .to(query.dtype)
-    )
-    sin = (
-        self.sin_cache.index_select(0, positions_flat)
-        .view(batch_size, 1, seq_len, -1)
-        .to(query.dtype)
-    )
+    if PRECOMPUTED_ROPE.cos is not None and offsets is None:
+        cos = PRECOMPUTED_ROPE.cos.view(batch_size, 1, seq_len, -1).to(query.dtype)
+        sin = PRECOMPUTED_ROPE.sin.view(batch_size, 1, seq_len, -1).to(query.dtype)
+    else:
+        positions_flat = positions.flatten()
+        cos = (
+            self.cos_cache.index_select(0, positions_flat)
+            .view(batch_size, 1, seq_len, -1)
+            .to(query.dtype)
+        )
+        sin = (
+            self.sin_cache.index_select(0, positions_flat)
+            .view(batch_size, 1, seq_len, -1)
+            .to(query.dtype)
+        )
 
     query_shape = query.shape
     query = query.view(batch_size, seq_len, -1, self.head_size)
